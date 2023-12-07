@@ -5,6 +5,10 @@ import functools
 from . import fmt
 from .config import Config
 from .electrum import Electrum
+from pprint import pprint
+import pickle
+
+edges_cache = None
 
 def debug(message):
     sys.stderr.write(message + "\n")
@@ -19,6 +23,17 @@ def strategy(_func=None,*,name):
         return call_strategy
     return register_strategy
 
+def calculate_slices(max_value, current_value, num_slices):
+    # Calculate the size of each slice
+    slice_size = max_value // num_slices
+
+    # Find the slice number containing the current_value
+    current_slice = min(current_value // slice_size, num_slices - 1)
+
+    # Determine the upper value of the slice closest to current without going over
+    slice_point = min((current_slice + 1) * slice_size - 1, max_value)
+
+    return slice_point
 
 class StrategyDelegate:
     STRATEGIES = {}
@@ -48,6 +63,11 @@ class StrategyDelegate:
 
     def effective_max_htlc_msat(self, channel):
         result = self.policy.getint('max_htlc_msat')
+
+        slices = self.policy.getint('max_htlc_proportional_slices')
+        if slices:
+            result = calculate_slices(channel.capacity, channel.local_balance, slices)
+
         ratio = self.policy.getfloat('max_htlc_msat_ratio')
         if ratio:
             ratio = max(0,min(1,ratio))
@@ -117,6 +137,79 @@ def strategy_match_peer(channel, policy, **kwargs):
     peernode_policy = chan_info.node1_policy if chan_info.node2_pub == my_pubkey else chan_info.node2_policy
     return (policy.getint('base_fee_msat', peernode_policy.fee_base_msat),
             policy.getint('fee_ppm', peernode_policy.fee_rate_milli_msat))
+
+@strategy(name = 'match_peer_inbound_weighted_average')
+def strategy_match_peer_inbound_weighted_average(channel, policy, **kwargs):
+    lnd = kwargs['lnd']
+    chan_info = lnd.get_chan_info(channel.chan_id)
+    my_pubkey = lnd.get_own_pubkey()
+
+    peer_node_id = chan_info.node1_pub if chan_info.node2_pub == my_pubkey else chan_info.node2_pub
+
+    # avoid having to fetch get_edges() multiple times
+    global edges_cache
+
+    if not edges_cache:
+        edges_list = lnd.get_edges()
+        # cache only the data we need
+        edges = []
+        for edge in edges_list:
+            the_edge = {
+                "node1_pub": edge.node1_pub,
+                "node2_pub": edge.node2_pub,
+                'capacity': edge.capacity,
+                "node1_policy": {
+                   'fee_rate_milli_msat': edge.node1_policy.fee_rate_milli_msat
+                },
+                "node2_policy": {
+                   'fee_rate_milli_msat': edge.node2_policy.fee_rate_milli_msat
+                }
+            }
+            edges.append(the_edge)
+        edges_cache = edges
+    else:
+        edges = edges_cache
+
+    peer_inbound = []
+
+    total_peer_capacity = 0
+    weighted_average_inbound_fee = 0
+
+    for edge in edges:
+        if edge['node1_pub'] == peer_node_id:
+            # We will take node2_policy because we want inbound policy, not outbound
+            inbound = {
+                'capacity': edge['capacity'],
+                'fee_rate_milli_msat': edge['node2_policy']['fee_rate_milli_msat']
+            }
+            total_peer_capacity += edge['capacity']
+            peer_inbound.append(inbound)
+        elif edge['node2_pub'] == peer_node_id:
+            inbound = {
+                'capacity': edge['capacity'],
+                'fee_rate_milli_msat': edge['node1_policy']['fee_rate_milli_msat']
+            }
+            peer_inbound.append(inbound)
+            total_peer_capacity += edge['capacity']
+
+    # Calculate the weighted average inbound fee by multiplying each fee by
+    # the adjusted ratio and taking the sum.
+
+    max_usable_ppm = policy.getint('inbound_skip_fee_rate_above_ppm')
+
+    for inbound in peer_inbound:
+        if inbound['fee_rate_milli_msat'] >= max_usable_ppm:
+            # ignore fee rate values over max_usable_ppm in our calculation
+            continue
+        weighted_average_inbound_fee += int((inbound['capacity']/total_peer_capacity)*inbound['fee_rate_milli_msat'])
+
+    premium_pct = policy.getint('inbound_weighted_average_fee_rate_premium_percent')
+
+    if premium_pct:
+        premium = int(weighted_average_inbound_fee * (premium_pct/100))
+        weighted_average_inbound_fee += premium
+
+    return (policy.getint('fee_ppm'), weighted_average_inbound_fee)
 
 @strategy(name = 'cost')
 def strategy_cost(channel, policy, **kwargs):

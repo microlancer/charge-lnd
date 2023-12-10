@@ -45,6 +45,8 @@ def main():
 
     my_pubkey = lnd.get_own_pubkey()
 
+    count = 0
+
     channels = lnd.get_channels()
     for channel in channels:
         policy = policies.get_policy_for(channel)
@@ -123,7 +125,9 @@ def main():
                 if time_lock_delta_changed:
                     s = ' ➜ ' + fmt.col_hi(new_time_lock_delta)
                 print("  time_lock_delta: %s%s" % (fmt.col_hi(my_policy.time_lock_delta), s) )
-
+        count += 1
+        if count > 100:
+            return True
     return True
 
 def get_argument_parser():
